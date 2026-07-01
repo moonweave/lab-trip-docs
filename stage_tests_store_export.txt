@@ -1,0 +1,106 @@
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from tripdoc.exporters import excel_summary, zip_export
+from tripdoc.store import (
+    add_document,
+    add_traveler,
+    connect,
+    create_trip,
+    list_documents,
+    list_travelers,
+    list_trips,
+    traveler_document_summary,
+    trip_summary,
+    upsert_traveler,
+)
+
+
+class StoreExportTests(unittest.TestCase):
+    def test_store_and_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            conn = connect(root / "app.db")
+            trip_id = create_trip(conn, "Test Trip")
+            traveler_id = add_traveler(conn, trip_id, "김철수", "Chulsoo Kim")
+            upload_dir = root / "uploads" / f"trip-{trip_id}"
+            upload_dir.mkdir(parents=True)
+            original = upload_dir / "receipt.txt"
+            original.write_text("receipt", encoding="utf-8")
+            add_document(
+                conn,
+                trip_id=trip_id,
+                traveler_id=traveler_id,
+                uploaded_by="김철수",
+                original_filename="receipt.txt",
+                stored_path=str(original.relative_to(root)),
+                category="meal",
+                category_confidence=0.74,
+                status="reviewed",
+                detected_travelers="김철수:0.95",
+                amount_hint="KRW 10,000",
+                file_size=7,
+                page_count=1,
+            )
+            travelers = list_travelers(conn, trip_id)
+            docs = list_documents(conn, trip_id)
+            trip = {"id": trip_id, "name": "Test Trip", "description": ""}
+            xlsx = excel_summary(root / "summary.xlsx", trip, travelers, docs)
+            package = zip_export(root / "package.zip", trip, travelers, docs, root)
+            self.assertTrue(xlsx.exists())
+            self.assertTrue(package.exists())
+            self.assertEqual(trip_summary(conn, trip_id)["reviewed_count"], 1)
+            self.assertEqual(traveler_document_summary(conn, trip_id)[0]["meal_count"], 1)
+
+    def test_upsert_traveler_preserves_existing_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(Path(temp_dir) / "app.db")
+            trip_id = create_trip(conn, "Test Trip")
+            first = upsert_traveler(conn, trip_id, "김철수", "Chulsoo Kim")
+            second = upsert_traveler(conn, trip_id, "김철수", "Chulsoo Kim", "Kim CS")
+            self.assertEqual(first, second)
+            self.assertEqual(len(list_travelers(conn, trip_id)), 1)
+            self.assertEqual(list_travelers(conn, trip_id)[0]["aliases"], "Kim CS")
+
+    def test_migration_adds_new_document_columns_to_existing_database(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "app.db"
+            raw = sqlite3.connect(path)
+            raw.execute("CREATE TABLE trips (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            raw.execute("CREATE TABLE travelers (id INTEGER PRIMARY KEY AUTOINCREMENT, trip_id INTEGER NOT NULL, display_name TEXT NOT NULL, english_name TEXT NOT NULL DEFAULT '', aliases TEXT NOT NULL DEFAULT '', affiliation TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            raw.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, trip_id INTEGER NOT NULL, traveler_id INTEGER, uploaded_by TEXT NOT NULL DEFAULT '', original_filename TEXT NOT NULL, stored_path TEXT NOT NULL, mime_type TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT 'misc', status TEXT NOT NULL DEFAULT 'needs_review', extracted_text TEXT NOT NULL DEFAULT '', date_hint TEXT NOT NULL DEFAULT '', amount_hint TEXT NOT NULL DEFAULT '', match_confidence REAL NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            raw.commit()
+            raw.close()
+            conn = connect(path)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+            self.assertIn("category_confidence", columns)
+            self.assertIn("detected_travelers", columns)
+            self.assertIn("file_size", columns)
+            self.assertIn("page_count", columns)
+
+    def test_list_trips_includes_attention_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            conn = connect(root / "app.db")
+            trip_id = create_trip(conn, "Test Trip")
+            upload_dir = root / "uploads" / f"trip-{trip_id}"
+            upload_dir.mkdir(parents=True)
+            original = upload_dir / "unknown.txt"
+            original.write_text("unknown", encoding="utf-8")
+            add_document(
+                conn,
+                trip_id=trip_id,
+                traveler_id=None,
+                original_filename="unknown.txt",
+                stored_path=str(original.relative_to(root)),
+                status="needs_review",
+            )
+            trip = list_trips(conn)[0]
+            self.assertEqual(trip["needs_review_count"], 1)
+            self.assertEqual(trip["unassigned_count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
