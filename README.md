@@ -15,6 +15,12 @@
 5. 관리자는 `검토필요`, `사람 미지정`, `문서 유형` 필터로 빠르게 확인합니다.
 6. `Excel 요약`과 `사람별 PDF + 원본 ZIP`을 내려받습니다.
 
+## 환경 조건
+
+중앙 PC 사양, 네트워크, 방화벽, 저장소, 보안 기준, `uv` 기반 실행법은 `REQUIREMENTS.md`에 정리되어 있습니다.
+
+요약하면 Python 3.12를 권장하고, 프로젝트 메타데이터상 Python 3.10 이상을 지원합니다. 패키지 의존성은 `requirements.txt`에 있습니다.
+
 ## 이번 버전에서 강화된 부분
 
 - 여러 사람이 한 문서에 같이 나오는 경우 자동 확정하지 않고 `검토필요`로 분리합니다.
@@ -26,6 +32,19 @@
 - Python 3.13에서 제거된 `cgi` 의존성을 없앴습니다.
 
 ## 빠른 실행
+
+`uv`를 쓰는 경우:
+
+```bash
+uv python install 3.12
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip sync requirements.txt
+export TRIPDOC_ADMIN_PASSWORD='strong-password'
+python -m tripdoc
+```
+
+일반 `pip`를 쓰는 경우:
 
 ```bash
 python -m pip install -r requirements.txt
