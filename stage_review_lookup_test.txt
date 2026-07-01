@@ -1,0 +1,1 @@
+writer = [value for key, value in store_mod.__dict__.items() if key.endswith('document_review')][0]
