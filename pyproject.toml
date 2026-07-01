@@ -1,7 +1,7 @@
 [project]
 name = "lab-trip-docs"
-version = "0.1.0"
-description = "Internal lab web app for collecting, classifying, and exporting trip documents."
+version = "0.2.0"
+description = "Internal lab web app for collecting, classifying, reviewing, and exporting trip documents."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,4 +15,3 @@ lab-trip-docs = "tripdoc.__main__:main"
 
 [tool.setuptools]
 packages = ["tripdoc"]
-
