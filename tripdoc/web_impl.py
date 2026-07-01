@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from email import policy
+from email.parser import BytesParser
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import base64
+import html
+import mimetypes
+import re
+import secrets
+import uuid
+from urllib.parse import parse_qs, urlencode, urlparse
+
+from . import store as store_mod
+from .analyze import TravelerCandidate, analyze_document
+from .config import Config
+from .exporters import excel_summary, zip_export
+from .roster import load_roster
+
+CATEGORIES = ["airfare", "boarding_pass", "lodging", "conference_registration", "badge", "meal", "transport", "misc"]
+STATUSES = ["auto_matched", "needs_review", "reviewed", "excluded"]
+CATEGORY_LABELS = {"airfare": "항공권/여정", "boarding_pass": "탑승권", "lodging": "숙박", "conference_registration": "학회등록", "badge": "명찰", "meal": "식비", "transport": "교통", "misc": "기타"}
+STATUS_LABELS = {"auto_matched": "자동매칭", "needs_review": "검토필요", "reviewed": "검토완료", "excluded": "제외"}
+
+
+@dataclass
+class UploadedFile:
+    filename: str
+    content: bytes
+    mime_type: str
+
+
+def esc(value: object) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def slug_filename(filename: str) -> str:
+    name = Path(filename).name
+    name = re.sub(r"[^\w.\-가-힣 ]+", "_", name, flags=re.UNICODE).strip()
+    return name or "upload.bin"
+
+
+def pct(part: int, total: int) -> int:
+    return int(round((part / total) * 100)) if total else 0
+
+
+def selected(value: object, current: object) -> str:
+    return " selected" if str(value) == str(current) else ""
+
+
+def review_writer():
+    if hasattr(store_mod, "save_document_review"):
+        return store_mod.save_document_review
+    for key, value in store_mod.__dict__.items():
+        if key.endswith("document_review"):
+            return value
+    raise RuntimeError("document review writer is unavailable")
+
+
+def doc_summary(documents: list[dict], travelers: list[dict]) -> dict[str, int]:
+    total = len(documents)
+    reviewed = sum(1 for doc in documents if doc.get("status") == "reviewed")
+    auto = sum(1 for doc in documents if doc.get("status") == "auto_matched")
+    needs = sum(1 for doc in documents if doc.get("status") == "needs_review")
+    unassigned = sum(1 for doc in documents if not doc.get("traveler_id"))
+    no_text = sum(1 for doc in documents if not doc.get("extracted_text"))
+    return {"traveler_count": len(travelers), "document_count": total, "reviewed_count": reviewed, "auto_matched_count": auto, "needs_review_count": needs, "unassigned_count": unassigned, "no_text_count": no_text}
+
+
+def traveler_rows(travelers: list[dict], documents: list[dict]) -> list[dict]:
+    rows = []
+    for traveler in travelers:
+        docs = [doc for doc in documents if doc.get("traveler_id") == traveler["id"]]
+        row = {"id": traveler["id"], "display_name": traveler["display_name"], "document_count": len(docs), "needs_review_count": sum(1 for doc in docs if doc.get("status") == "needs_review")}
+        for category in CATEGORIES:
+            row[f"{category}_count"] = sum(1 for doc in docs if doc.get("category") == category)
+        rows.append(row)
+    return rows
+
+
+def add_or_keep_traveler(conn, trip_id: int, record: dict[str, str]) -> int:
+    name = (record.get("display_name") or "").strip()
+    english = (record.get("english_name") or "").strip()
+    if not name:
+        return 0
+    for traveler in store_mod.list_travelers(conn, trip_id):
+        if traveler["display_name"].casefold() == name.casefold() or (english and traveler["english_name"].casefold() == english.casefold()):
+            return int(traveler["id"])
+    return store_mod.add_traveler(conn, trip_id, name, english, record.get("aliases", ""), record.get("affiliation", ""))
+
+
+def filter_docs(documents: list[dict], status: str = "", category: str = "", traveler_id: int | None = None) -> list[dict]:
+    result = []
+    for doc in documents:
+        if status and doc.get("status") != status:
+            continue
+        if category and doc.get("category") != category:
+            continue
+        if traveler_id is not None:
+            if traveler_id == 0 and doc.get("traveler_id"):
+                continue
+            if traveler_id != 0 and doc.get("traveler_id") != traveler_id:
+                continue
+        result.append(doc)
+    return sorted(result, key=lambda doc: (0 if doc.get("status") == "needs_review" else 1, -int(doc.get("id") or 0)))
+
+
+def layout(title: str, body: str) -> str:
+    return f"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)}</title><style>
+body{{margin:0;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#f6f7f9;color:#17202a}}header{{background:#111827;color:white;padding:14px 24px}}header a{{color:white}}main{{max-width:1280px;margin:0 auto;padding:24px}}a{{color:#1f6feb;text-decoration:none}}.panel,.card{{background:white;border:1px solid #d8dee8;border-radius:10px;padding:16px;margin-bottom:16px}}.grid,.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}}.metric{{font-size:26px;font-weight:800}}.hint,.muted{{color:#687385;font-size:13px}}label{{display:block;font-weight:700;margin:10px 0 5px}}input,textarea,select{{width:100%;box-sizing:border-box;padding:9px;border:1px solid #d8dee8;border-radius:6px}}button,.button{{display:inline-block;background:#1f6feb;color:white;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer;margin-top:8px}}.secondary{{background:#374151}}table{{width:100%;border-collapse:collapse;background:white;font-size:14px}}th,td{{border-bottom:1px solid #d8dee8;text-align:left;padding:8px;vertical-align:top}}th{{background:#f1f4f8}}pre{{white-space:pre-wrap;max-height:160px;overflow:auto;background:#f8fafc;padding:10px;border-radius:6px}}.pill{{display:inline-block;padding:2px 7px;border-radius:999px;background:#e8f0fe;color:#174ea6;font-size:12px;font-weight:700}}.status-needs_review{{background:#fff4ce;color:#9a6700}}.status-reviewed{{background:#dcfce7;color:#166534}}.status-excluded{{background:#f3f4f6;color:#374151}}.category{{background:#f3e8ff;color:#6b21a8}}.filters{{display:flex;flex-wrap:wrap;gap:8px}}.filters a{{padding:7px 10px;border:1px solid #d8dee8;border-radius:999px;background:white}}.filters a.active{{background:#111827;color:white}}.rowform{{display:grid;grid-template-columns:1fr 1fr 1fr 1.5fr auto;gap:8px;align-items:end}}@media(max-width:900px){{main{{padding:14px}}.rowform{{grid-template-columns:1fr}}}}
+</style></head><body><header><a href="/"><strong>Lab Trip Docs</strong></a> <span class="muted">출장 서류 자동취합</span></header><main>{body}</main></body></html>"""
+
+
+class TripDocHandler(BaseHTTPRequestHandler):
+    config: Config
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+    @property
+    def conn(self):
+        return store_mod.connect(self.config.db_path)
+
+    def authenticated(self) -> bool:
+        if urlparse(self.path).path == "/health":
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
+        except Exception:
+            return False
+        username, _, password = decoded.partition(":")
+        return secrets.compare_digest(username, self.config.admin_user) and secrets.compare_digest(password, self.config.admin_password)
+
+    def require_auth(self) -> bool:
+        if self.authenticated():
+            return True
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", 'Basic realm="Lab Trip Docs"')
+        self.end_headers()
+        return False
+
+    def do_GET(self) -> None:
+        if not self.require_auth():
+            return
+        path = urlparse(self.path).path
+        if path == "/health":
+            self.send_text("ok")
+        elif path == "/":
+            self.index()
+        elif match := re.fullmatch(r"/trips/(\d+)", path):
+            self.trip_detail(int(match.group(1)))
+        elif match := re.fullmatch(r"/documents/(\d+)/file", path):
+            self.document_file(int(match.group(1)))
+        elif match := re.fullmatch(r"/trips/(\d+)/export.xlsx", path):
+            self.export_xlsx(int(match.group(1)))
+        elif match := re.fullmatch(r"/trips/(\d+)/export.zip", path):
+            self.export_zip(int(match.group(1)))
+        else:
+            self.not_found()
+
+    def do_POST(self) -> None:
+        if not self.require_auth():
+            return
+        path = urlparse(self.path).path
+        if path == "/trips":
+            self.create_trip_route()
+        elif match := re.fullmatch(r"/trips/(\d+)/roster", path):
+            self.upload_roster(int(match.group(1)))
+        elif match := re.fullmatch(r"/trips/(\d+)/travelers", path):
+            self.create_traveler_route(int(match.group(1)))
+        elif match := re.fullmatch(r"/trips/(\d+)/documents", path):
+            self.upload_documents(int(match.group(1)))
+        elif match := re.fullmatch(r"/documents/(\d+)/review", path):
+            self.review_document(int(match.group(1)))
+        else:
+            self.not_found()
+
+    def parse_form(self) -> tuple[dict[str, str], dict[str, list[UploadedFile]]]:
+        content_type = self.headers.get("Content-Type", "")
+        content_length = int(self.headers.get("Content-Length", "0"))
+        fields: dict[str, str] = {}
+        files: dict[str, list[UploadedFile]] = {}
+        if content_type.startswith("multipart/form-data"):
+            raw_body = self.rfile.read(content_length)
+            message = BytesParser(policy=policy.default).parsebytes(b"Content-Type: " + content_type.encode("utf-8") + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw_body)
+            for part in message.iter_parts():
+                if part.get_content_disposition() != "form-data":
+                    continue
+                name = part.get_param("name", header="content-disposition")
+                if not name:
+                    continue
+                payload = part.get_payload(decode=True) or b""
+                filename = part.get_filename()
+                if filename:
+                    files.setdefault(name, []).append(UploadedFile(filename, payload, part.get_content_type() or ""))
+                else:
+                    fields[name] = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        else:
+            raw = self.rfile.read(content_length).decode("utf-8")
+            fields = {key: values[-1] for key, values in parse_qs(raw).items()}
+        return fields, files
+
+    def index(self) -> None:
+        with self.conn as conn:
+            trips = store_mod.list_trips(conn)
+        rows = ""
+        for trip in trips:
+            with self.conn as conn:
+                docs = store_mod.list_documents(conn, int(trip["id"]))
+                travelers = store_mod.list_travelers(conn, int(trip["id"]))
+            summary = doc_summary(docs, travelers)
+            rows += f"<tr><td><a href='/trips/{trip['id']}'><strong>{esc(trip['name'])}</strong></a><br><span class='muted'>{esc(trip.get('description',''))}</span></td><td>{summary['traveler_count']}</td><td>{summary['document_count']}</td><td><span class='pill status-needs_review'>{summary['needs_review_count']} 검토</span> <span class='pill'>{summary['unassigned_count']} 미지정</span></td><td class='muted'>{esc(trip['created_at'])}</td></tr>"
+        rows = rows or "<tr><td colspan='5' class='muted'>아직 출장 건이 없습니다.</td></tr>"
+        body = f"<h1>출장 서류 자동취합</h1><p class='muted'>파일을 중앙 PC에 모으고, 검토필요 문서만 빠르게 정리합니다.</p><section class='panel'><h2>새 출장 건 만들기</h2><form method='post' action='/trips'><label>출장 건 이름</label><input name='name' required placeholder='예: 2026 E-MRS 출장'><label>설명</label><textarea name='description' rows='2'></textarea><button type='submit'>출장 건 생성</button></form></section><section class='panel'><h2>출장 건 목록</h2><table><thead><tr><th>이름</th><th>출장자</th><th>문서</th><th>주의</th><th>생성일</th></tr></thead><tbody>{rows}</tbody></table></section>"
+        self.send_html(layout("Lab Trip Docs", body))
+
+    def trip_detail(self, trip_id: int) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        status_filter = query.get("status", [""])[0]
+        category_filter = query.get("category", [""])[0]
+        traveler_raw = query.get("traveler", [""])[0]
+        traveler_filter = int(traveler_raw) if traveler_raw.isdigit() else None
+        with self.conn as conn:
+            trip = store_mod.get_trip(conn, trip_id)
+            if not trip:
+                self.not_found(); return
+            travelers = store_mod.list_travelers(conn, trip_id)
+            all_docs = store_mod.list_documents(conn, trip_id)
+        docs = filter_docs(all_docs, status_filter, category_filter, traveler_filter)
+        summary = doc_summary(all_docs, travelers)
+        body = f"<p><a href='/'>← 출장 건 목록</a></p><h1>{esc(trip['name'])}</h1><p class='muted'>{esc(trip['description'])}</p>"
+        body += self.render_cards(summary) + self.render_inputs(trip_id) + self.render_exports(trip_id)
+        body += self.render_traveler_summary(traveler_rows(travelers, all_docs)) + self.render_filters(trip_id, status_filter, category_filter, traveler_filter, travelers)
+        body += self.render_documents(docs, travelers) + self.render_roster(travelers) + self.render_notes(summary, all_docs)
+        self.send_html(layout(trip["name"], body))
+
+    def render_cards(self, summary: dict[str, int]) -> str:
+        total = summary.get("document_count", 0)
+        done = summary.get("reviewed_count", 0) + summary.get("auto_matched_count", 0)
+        return f"<div class='cards'><div class='card'><div class='metric'>{summary.get('traveler_count',0)}</div><div class='hint'>출장자</div></div><div class='card'><div class='metric'>{total}</div><div class='hint'>전체 문서</div></div><div class='card'><div class='metric'>{summary.get('needs_review_count',0)}</div><div class='hint'>검토 필요</div></div><div class='card'><div class='metric'>{summary.get('unassigned_count',0)}</div><div class='hint'>사람 미지정</div></div><div class='card'><div class='metric'>{pct(done,total)}%</div><div class='hint'>진행률</div></div></div>"
+
+    def render_inputs(self, trip_id: int) -> str:
+        return f"<section class='grid'><div class='panel'><h2>1. 명단 병합</h2><p class='hint'>CSV/XLSX: 이름, 영문명, 별칭, 소속. 같은 이름은 보존합니다.</p><form method='post' action='/trips/{trip_id}/roster' enctype='multipart/form-data'><input type='file' name='roster' accept='.csv,.xlsx' required><button type='submit'>명단 병합</button></form></div><div class='panel'><h2>2. 사람 직접 추가</h2><form method='post' action='/trips/{trip_id}/travelers'><label>이름</label><input name='display_name' required><label>영문명</label><input name='english_name'><label>별칭</label><input name='aliases'><button type='submit'>출장자 추가</button></form></div><div class='panel'><h2>3. 문서 업로드</h2><form method='post' action='/trips/{trip_id}/documents' enctype='multipart/form-data'><label>업로드한 사람</label><input name='uploaded_by'><label>PDF/JPG/PNG/TXT</label><input type='file' name='documents' multiple required><p class='hint'>이미지는 파일명/업로더 기반 후보로 남습니다.</p><button type='submit'>업로드 및 분석</button></form></div></section>"
+
+    def render_exports(self, trip_id: int) -> str:
+        return f"<section class='panel'><h2>출력</h2><a class='button' href='/trips/{trip_id}/export.xlsx'>Excel 요약</a> <a class='button secondary' href='/trips/{trip_id}/export.zip'>사람별 PDF + 원본 ZIP</a></section>"
+
+    def render_filters(self, trip_id: int, status_filter: str, category_filter: str, traveler_filter: int | None, travelers: list[dict]) -> str:
+        def link(label: str, **params: object) -> str:
+            clean = {k: v for k, v in params.items() if v not in (None, "")}
+            url = f"/trips/{trip_id}" + (("?" + urlencode(clean)) if clean else "")
+            active = "active" if params.get("status", "") == status_filter and params.get("category", "") == category_filter and params.get("traveler") == traveler_filter else ""
+            return f"<a class='{active}' href='{url}'>{esc(label)}</a>"
+        cats = " ".join(link(CATEGORY_LABELS[c], category=c) for c in CATEGORIES)
+        opts = "".join(f"<option value='{t['id']}'{selected(t['id'], traveler_filter or '')}>{esc(t['display_name'])}</option>" for t in travelers)
+        return f"<section class='panel'><h2>검토 큐</h2><div class='filters'>{link('전체')}{link('검토 필요', status='needs_review')}{link('자동매칭', status='auto_matched')}{link('검토완료', status='reviewed')}{link('사람 미지정', traveler=0)}</div><p class='hint'>문서 유형</p><div class='filters'>{cats}</div><form method='get' action='/trips/{trip_id}' style='max-width:360px;margin-top:12px'><label>사람별 보기</label><select name='traveler'><option value=''>전체</option><option value='0'{selected(0, traveler_filter if traveler_filter is not None else '')}>미지정</option>{opts}</select><button type='submit'>적용</button></form></section>"
+
+    def render_traveler_summary(self, rows: list[dict]) -> str:
+        if not rows:
+            return ""
+        body = "".join(f"<tr><td>{esc(r['display_name'])}</td><td>{int(r['document_count'] or 0)}</td><td>{int(r['needs_review_count'] or 0)}</td><td>{int(r['airfare_count'] or 0)}</td><td>{int(r['boarding_pass_count'] or 0)}</td><td>{int(r['lodging_count'] or 0)}</td><td>{int(r['conference_registration_count'] or 0)}</td><td>{int(r['meal_count'] or 0)}</td><td>{int(r['transport_count'] or 0)}</td></tr>" for r in rows)
+        return f"<section class='panel'><h2>사람별 현황</h2><table><thead><tr><th>이름</th><th>문서</th><th>검토</th><th>항공</th><th>탑승</th><th>숙박</th><th>학회</th><th>식비</th><th>교통</th></tr></thead><tbody>{body}</tbody></table></section>"
+
+    def render_documents(self, docs: list[dict], travelers: list[dict]) -> str:
+        rows = "".join(self.render_doc_row(d, travelers) for d in docs) or "<tr><td colspan='6' class='muted'>조건에 맞는 문서가 없습니다.</td></tr>"
+        return f"<section class='panel'><h2>문서 검토</h2><table><thead><tr><th>파일</th><th>분류</th><th>사람</th><th>힌트</th><th>근거</th><th>수정</th></tr></thead><tbody>{rows}</tbody></table></section>"
+
+    def render_doc_row(self, doc: dict, travelers: list[dict]) -> str:
+        traveler_options = '<option value="">확인 필요/미지정</option>' + "".join(f'<option value="{t["id"]}"{selected(t["id"], doc.get("traveler_id") or "")}>{esc(t["display_name"])}</option>' for t in travelers)
+        category_options = "".join(f'<option value="{c}"{selected(c, doc["category"])}>{esc(CATEGORY_LABELS[c])}</option>' for c in CATEGORIES)
+        status_options = "".join(f'<option value="{s}"{selected(s, doc["status"])}>{esc(STATUS_LABELS[s])}</option>' for s in STATUSES)
+        preview = esc((doc.get("extracted_text") or "")[:1200]) or "추출된 텍스트 없음"
+        return f"<tr><td><a href='/documents/{doc['id']}/file'><strong>{esc(doc['original_filename'])}</strong></a><br><span class='muted'>by {esc(doc['uploaded_by'])}</span></td><td><span class='pill category'>{esc(CATEGORY_LABELS.get(doc['category'], doc['category']))}</span></td><td>{esc(doc.get('traveler_name') or '미지정')}<br><span class='muted'>매칭 {float(doc.get('match_confidence') or 0):.2f}</span><br><span class='pill status-{esc(doc['status'])}'>{esc(STATUS_LABELS.get(doc['status'], doc['status']))}</span></td><td>{esc(doc.get('date_hint') or '')}<br>{esc(doc.get('amount_hint') or '')}</td><td>{esc(doc.get('notes') or '')}<details><summary>추출 텍스트</summary><pre>{preview}</pre></details></td><td><form class='rowform' method='post' action='/documents/{doc['id']}/review'><select name='traveler_id'>{traveler_options}</select><select name='category'>{category_options}</select><select name='status'>{status_options}</select><input name='notes' value='{esc(doc.get('notes') or '')}'><button type='submit'>저장</button></form></td></tr>"
+
+    def render_roster(self, travelers: list[dict]) -> str:
+        rows = "".join(f"<tr><td>{esc(t['display_name'])}</td><td>{esc(t['english_name'])}</td><td>{esc(t['aliases'])}</td><td>{esc(t['affiliation'])}</td></tr>" for t in travelers) or "<tr><td colspan='4' class='muted'>명단을 추가하세요.</td></tr>"
+        return f"<section class='panel'><h2>출장자 명단</h2><table><thead><tr><th>이름</th><th>영문명</th><th>별칭</th><th>소속</th></tr></thead><tbody>{rows}</tbody></table></section>"
+
+    def render_notes(self, summary: dict[str, int], docs: list[dict]) -> str:
+        first = [d for d in docs if d.get("status") == "needs_review"][:5]
+        rows = "".join(f"<li>#{d['id']} {esc(d['original_filename'])}: {esc(d['notes'])}</li>" for d in first) or "<li>현재 우선 검토할 문서가 없습니다.</li>"
+        return f"<section class='panel'><h2>운영 체크리스트</h2><p>검토필요 {summary.get('needs_review_count',0)}건, 사람 미지정 {summary.get('unassigned_count',0)}건, 텍스트 미추출 {summary.get('no_text_count',0)}건입니다.</p><ul>{rows}</ul><p class='hint'>이미지 영수증과 스캔 PDF는 OCR 연동 전까지 검토필요로 남는 것이 정상입니다.</p></section>"
+
+    def create_trip_route(self) -> None:
+        fields, _ = self.parse_form()
+        name = fields.get("name", "").strip()
+        if not name:
+            self.redirect("/"); return
+        with self.conn as conn:
+            trip_id = store_mod.create_trip(conn, name, fields.get("description", ""))
+        self.redirect(f"/trips/{trip_id}")
+
+    def create_traveler_route(self, trip_id: int) -> None:
+        fields, _ = self.parse_form()
+        record = {"display_name": fields.get("display_name", ""), "english_name": fields.get("english_name", ""), "aliases": fields.get("aliases", ""), "affiliation": fields.get("affiliation", "")}
+        with self.conn as conn:
+            add_or_keep_traveler(conn, trip_id, record)
+        self.redirect(f"/trips/{trip_id}")
+
+    def upload_roster(self, trip_id: int) -> None:
+        _, files = self.parse_form()
+        uploads = files.get("roster", [])
+        if not uploads:
+            self.redirect(f"/trips/{trip_id}"); return
+        temp_dir = self.config.data_dir / "tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"{uuid.uuid4().hex}_{slug_filename(uploads[0].filename)}"
+        temp_path.write_bytes(uploads[0].content)
+        records = load_roster(temp_path)
+        with self.conn as conn:
+            for record in records:
+                add_or_keep_traveler(conn, trip_id, record)
+        temp_path.unlink(missing_ok=True)
+        self.redirect(f"/trips/{trip_id}")
+
+    def upload_documents(self, trip_id: int) -> None:
+        fields, files = self.parse_form()
+        uploaded_by = fields.get("uploaded_by", "").strip()
+        upload_dir = self.config.uploads_dir / f"trip-{trip_id}"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        with self.conn as conn:
+            travelers = [TravelerCandidate(int(r["id"]), r["display_name"], r["english_name"], r["aliases"]) for r in store_mod.list_travelers(conn, trip_id)]
+            for upload in files.get("documents", []):
+                clean_name = slug_filename(upload.filename)
+                stored_path = upload_dir / f"{uuid.uuid4().hex}_{clean_name}"
+                stored_path.write_bytes(upload.content)
+                result = analyze_document(stored_path, travelers, uploaded_by)
+                notes = result.notes
+                if result.detected_travelers:
+                    notes = f"{notes}; detected {result.detected_travelers}" if notes else f"detected {result.detected_travelers}"
+                store_mod.add_document(conn, trip_id=trip_id, traveler_id=result.matched_traveler_id, uploaded_by=uploaded_by, original_filename=clean_name, stored_path=str(stored_path.relative_to(self.config.data_dir)), mime_type=upload.mime_type, category=result.category, status=result.status, extracted_text=result.extracted_text, date_hint=result.date_hint, amount_hint=result.amount_hint, match_confidence=result.match_confidence, notes=notes)
+        self.redirect(f"/trips/{trip_id}")
+
+    def review_document(self, document_id: int) -> None:
+        fields, _ = self.parse_form()
+        traveler_raw = fields.get("traveler_id", "").strip()
+        traveler_id = int(traveler_raw) if traveler_raw else None
+        status = fields.get("status", "needs_review") if fields.get("status", "needs_review") in STATUSES else "needs_review"
+        category = fields.get("category", "misc") if fields.get("category", "misc") in CATEGORIES else "misc"
+        with self.conn as conn:
+            doc = store_mod.get_document(conn, document_id)
+            if not doc:
+                self.not_found(); return
+            review_writer()(conn, document_id, traveler_id, category, status, fields.get("notes", ""))
+        self.redirect(f"/trips/{doc['trip_id']}")
+
+    def document_file(self, document_id: int) -> None:
+        with self.conn as conn:
+            doc = store_mod.get_document(conn, document_id)
+        if not doc:
+            self.not_found(); return
+        path = self.config.data_dir / doc["stored_path"]
+        if not path.exists():
+            self.not_found(); return
+        mime = doc["mime_type"] or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self.send_bytes(path.read_bytes(), mime, doc["original_filename"])
+
+    def export_xlsx(self, trip_id: int) -> None:
+        with self.conn as conn:
+            trip = store_mod.get_trip(conn, trip_id)
+            if not trip:
+                self.not_found(); return
+            travelers = store_mod.list_travelers(conn, trip_id)
+            docs = store_mod.list_documents(conn, trip_id)
+        path = self.config.exports_dir / f"trip-{trip_id}" / "summary.xlsx"
+        excel_summary(path, trip, travelers, docs)
+        self.send_bytes(path.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", path.name)
+
+    def export_zip(self, trip_id: int) -> None:
+        with self.conn as conn:
+            trip = store_mod.get_trip(conn, trip_id)
+            if not trip:
+                self.not_found(); return
+            travelers = store_mod.list_travelers(conn, trip_id)
+            docs = store_mod.list_documents(conn, trip_id)
+        path = self.config.exports_dir / f"trip-{trip_id}" / "trip-package.zip"
+        zip_export(path, trip, travelers, docs, self.config.data_dir)
+        self.send_bytes(path.read_bytes(), "application/zip", path.name)
+
+    def send_html(self, content: str) -> None:
+        self.send_bytes(content.encode("utf-8"), "text/html; charset=utf-8")
+
+    def send_text(self, content: str) -> None:
+        self.send_bytes(content.encode("utf-8"), "text/plain; charset=utf-8")
+
+    def send_bytes(self, content: bytes, content_type: str, filename: str | None = None) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{slug_filename(filename)}"')
+        self.end_headers()
+        self.wfile.write(content)
+
+    def redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def not_found(self) -> None:
+        self.send_response(HTTPStatus.NOT_FOUND)
+        self.end_headers()
+        self.wfile.write(b"not found")
+
+
+def run(config: Config) -> None:
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    config.uploads_dir.mkdir(parents=True, exist_ok=True)
+    config.exports_dir.mkdir(parents=True, exist_ok=True)
+    with store_mod.connect(config.db_path):
+        pass
+    handler = type("ConfiguredTripDocHandler", (TripDocHandler,), {"config": config})
+    server = ThreadingHTTPServer((config.host, config.port), handler)
+    print(f"Lab Trip Docs running at http://{config.host}:{config.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
