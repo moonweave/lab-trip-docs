@@ -1,0 +1,15 @@
+services:
+  lab-trip-docs:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      TRIPDOC_HOST: 0.0.0.0
+      TRIPDOC_PORT: 8501
+      TRIPDOC_DATA_DIR: /app/data
+      TRIPDOC_ADMIN_USER: admin
+      TRIPDOC_ADMIN_PASSWORD: change-me
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
