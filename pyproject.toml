@@ -1,0 +1,18 @@
+[project]
+name = "lab-trip-docs"
+version = "0.1.0"
+description = "Internal lab web app for collecting, classifying, and exporting trip documents."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pypdf>=5.0",
+    "openpyxl>=3.1",
+    "reportlab>=4.0",
+]
+
+[project.scripts]
+lab-trip-docs = "tripdoc.__main__:main"
+
+[tool.setuptools]
+packages = ["tripdoc"]
+
