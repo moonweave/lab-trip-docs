@@ -1,0 +1,29 @@
+# Roadmap
+
+## Phase 1: Internal MVP
+
+- Central PC web upload
+- Trip and traveler management
+- Heuristic document classification
+- Name matching by Korean name, English name, aliases
+- Admin review screen
+- Excel and ZIP export
+
+## Phase 2: Practical Lab Use
+
+- PDF page preview
+- Batch review shortcuts
+- OCR for scanned PDF and images
+- Duplicate receipt detection
+- Missing document checklist
+- Per-institution export templates
+
+## Phase 3: Production Service
+
+- Role-based accounts
+- Audit log
+- Encrypted storage
+- SSO or institution login
+- Background worker queue
+- Optional LLM extraction for hard documents
+
